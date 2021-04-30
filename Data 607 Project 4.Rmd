@@ -1,0 +1,246 @@
+---
+title: "Data 607 Project 4"
+author: "Claire Meyer"
+date: "4/25/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Predicting Spam and Ham {.tabset-pills}
+
+This document ingests documents of 'Spam' and 'Ham' (non-Spam), tidies as needed, and then creates a classification model to determine which class each document from a test set should fall into. 
+
+```{r libraries, include=FALSE}
+library(tidytext)
+library(tidymodels)
+library(tidyverse)
+library(textrecipes)
+library(glmnet)
+library(R.utils)
+```
+
+### Getting the data
+
+The spam and ham files are made available through [this site](https://spamassassin.apache.org/old/publiccorpus/), in a `.tar.bz2` file form. First we have to unzip these files into folders in the working directory. 
+
+```{r getting-data}
+# Get zip files from URLs and set a destination
+# https://statisticsglobe.com/download-file-in-r-example
+ham_url <- 'https://spamassassin.apache.org/old/publiccorpus/20021010_easy_ham.tar.bz2'
+spam_url <- 'https://spamassassin.apache.org/old/publiccorpus/20021010_spam.tar.bz2'
+download.file(ham_url,'ham.tar.bz2')
+download.file(spam_url,'spam.tar.bz2')
+
+# Address the .bz2 and unzip. 
+#https://stackoverflow.com/questions/25948777/extract-bz2-file-in-r
+bunzip2('ham.tar.bz2')
+bunzip2('spam.tar.bz2')
+
+# Address the .tar and untar. 
+# https://stackoverflow.com/questions/7151145/unzip-a-tar-gz-file
+untar('ham.tar')
+untar('spam.tar')
+```
+
+### Tidying the data {.tabset}
+
+Now the files should be in folders 'easyham' and 'spam' in the working directory. From there we can import each file into R and tidy: reading through each one, appending to a list, and converting to a usable dataframe for our modeling problem.
+
+```{r tidying-data}
+# Read through each file and add to a list, and then convert list to a dataframe
+# https://stackoverflow.com/questions/9564489/read-all-files-in-a-folder-and-apply-a-function-to-each-data-frame
+ham_files <- list.files("easy_ham", full.names=TRUE)
+ham_list <- lapply(ham_files, readLines,encoding = "UTF-8")
+ham_df <-as.data.frame(unlist(ham_list))
+colnames(ham_df) <- c('text')
+# Append a 'type' to specify it is 'ham' (0)
+ham_df$type <- 0
+
+spam_files <- list.files("spam", full.names=TRUE)
+spam_list <- lapply(spam_files, readLines,encoding = "UTF-8")
+spam_df <- as.data.frame(unlist(spam_list))
+colnames(spam_df) <- c('text')
+# Append a 'type' to specify it is 'spam' (1)
+spam_df$type <- 1
+
+# Combine the two dataframes into one with both types
+comb_df <- rbind(spam_df,ham_df)
+
+# Remove graphical text that causes issues later
+comb_df$text <- str_replace_all(comb_df$text,"[^[:graph:]]", " ") 
+
+# Make type a factor to use tidymodels
+comb_df$type <- as.factor(comb_df$type)
+```
+
+### Creating the Model
+
+We use tidymodels to create a model here, which involves a few steps. I followed and tweaked [this tutorial](https://www.hvitfeldt.me/blog/text-classification-with-tidymodels/), which used tidymodels to classify novels and built on some work by Julia Silge.
+
+The general process is as follows: 
+* We create our 'splits' to have a subset of the data for training and a subset for testing. 
+* Then we create a 'recipe', which processes the data in the ways we want: getting rid of empty text, tokenizing, filtering for token occurences over a certain frequency. 
+* Then we juice and bake. Per [R documentation](https://www.rdocumentation.org/packages/recipes/versions/0.1.15/topics/juice) juice() refers to processing the training set, while [bake()](https://www.rdocumentation.org/packages/recipes/versions/0.1.13/topics/bake) is applied to our test data. 
+* Set up a Logistic Regression model using ['glmnet' engine](https://rdrr.io/cran/parsnip/man/set_engine.html).
+* Fit the model to the test data. 
+
+```{r approach}
+# https://www.hvitfeldt.me/blog/text-classification-with-tidymodels/
+set.seed(1234) 
+
+# Use tidymodels to split, stratified on type, using an 80/20 split. `strata` makes sure we don't have all spam in one.
+spam_split <- initial_split(comb_df, strata = type, p = 0.8)
+train_data <- training(spam_split)
+test_data <- testing(spam_split)
+
+# Create a "recipe" to be applied to data as prep
+text_version <- recipe(type ~ ., data = train_data) %>%
+# We filter out empty text, of which there are many rows  
+  step_filter(text != "") %>%
+# Tokenize the test  
+  step_tokenize(text) %>%
+# Filter for tokens that occur > 5 times. Per documentation, this is important because the # of tokens (variables) can increase memory.
+  step_tokenfilter(text, min_times = 5) %>%
+# This counts instances of tokens (https://www.rdocumentation.org/packages/textrecipes/versions/0.4.0/topics/step_tf)
+  step_tf(text) %>%
+  prep(training = train_data)
+
+# Follow the recipe for training data with juice (), finalized training set
+text_v_train_data <- juice(text_version)
+
+# Apply to test data with bake ()
+text_v_test_data  <- bake(text_version, test_data)
+
+# Set up a logistic regression model, just the bones of the model and not where we apply it.
+glmnet_model <- logistic_reg(mixture = 0, penalty = 0.1) %>%
+  set_engine("glmnet")
+
+# Fit to prepped test data
+test_model <- glmnet_model %>%
+  fit(type ~ ., data = text_v_test_data)
+```
+
+### Evaluating the model
+
+Then we can evaluate the model. We can follow the above example and create an evaluation tibble to determine the accuracy and plot the ROC curve. We can also extend the tutorial to create a confusion matrix, and compare accuracy to precision and recall. This evaluation uses the [yardstick package](https://github.com/tidymodels/yardstick) from tidymodels.
+
+```{r eval-model}
+# Evaluation tibble sets up the predicted class and the predicted probabilities for the model on test data
+eval_tibble <- text_v_test_data %>%
+  select(type) %>%
+  mutate(
+    class_model = parsnip:::predict_class(test_model, text_v_test_data),
+    prop_model  = parsnip:::predict_classprob(test_model, text_v_test_data) %>% pull(`0`),
+  )
+
+# Accuracy tells us correct predictions/total observations:  
+accuracy(eval_tibble, truth = type, estimate = class_model)
+
+# Precision tell us the true positive predictions/total positive predictions: 
+precision(eval_tibble, truth = type, estimate = class_model)
+
+# Recall tells us true positive predictions/total positives:
+recall(eval_tibble, truth = type, estimate = class_model)
+
+# Or the confusion matrix allows for all to be calculated: 
+conf_mat(eval_tibble, truth = type , estimate = class_model, dnn = c("Prediction", "Truth"))
+```
+
+```{r roc-curve}
+# And we can pipe the evaluation tibble into an ROC curve
+eval_tibble %>%
+  roc_curve(type, prop_model) %>%
+  autoplot()
+```
+
+### Conclusion
+
+Accuracy is pretty high at 79%, but there is a class imbalance in this data set, with Ham accounting for 75% of the total instances. While accuracy beat out the class balance, the extremely high recall makes sense. The ROC curve looks good, but I'd like to extend this work to account for class imbalances.
+
+```{r table}
+table(comb_df$type)
+```
+
+### Extending with Down-sampling
+
+I did some research to see how to deal with class imbalance. There seem to be a number of techniques, but one - downsampling with tidymodels as part of the `recipe` - seems relatively easy to recreate. Let's compare a down-sampled model: 
+
+```{r down-sampling}
+# https://www.hvitfeldt.me/blog/text-classification-with-tidymodels/
+set.seed(2345) 
+# Use tidymodels to split, stratified on type, using an 80/20 split. `strata` makes sure we don't have all spam in one.
+spam_split_down <- initial_split(comb_df, strata = type, p = 0.8)
+train_data_down <- training(spam_split_down)
+test_data_down <- testing(spam_split_down)
+
+# Create a "recipe" to be applied to data as prep
+text_version_down <- recipe(type ~ ., data = train_data_down) %>%
+# We filter out empty text, of which there are many rows  
+  step_filter(text != "") %>%
+# Add a down-sampling step https://themis.tidymodels.org/
+  step_downsample(type,under_ratio = 1) %>%
+# Tokenize the test  
+  step_tokenize(text) %>%
+# Filter for tokens that occur > 5 times. Per documentation, this is important because the # of tokens (variables) can increase memory.
+  step_tokenfilter(text, min_times = 5) %>%
+# This counts instances of tokens (https://www.rdocumentation.org/packages/textrecipes/versions/0.4.0/topics/step_tf)
+  step_tf(text) %>%
+  prep(training = train_data_down)
+
+# Follow the recipe for training data with juice (), finalized training set
+text_v_train_data_down <- juice(text_version_down)
+# Apply to test data with bake ()
+text_v_test_data_down  <- bake(text_version, test_data_down)
+# Set up a logistic regression model, just the bones of the model and not where we apply it.
+glmnet_model <- logistic_reg(mixture = 0, penalty = 0.1) %>%
+  set_engine("glmnet")
+# Fit to prepped test data
+test_model_down <- glmnet_model %>%
+  fit(type ~ ., data = text_v_test_data_down)
+
+# Evaluation tibble sets up the predicted class and the predicted probabilities for the model on test data
+eval_tibble_down <- text_v_test_data_down %>%
+  select(type) %>%
+  mutate(
+    class_model = parsnip:::predict_class(test_model_down, text_v_test_data_down),
+    prop_model  = parsnip:::predict_classprob(test_model_down, text_v_test_data_down) %>% pull(`0`),
+  )
+
+# Accuracy tells us correct predictions/total observations:  
+accuracy(eval_tibble_down, truth = type, estimate = class_model)
+
+# Precision tell us the true positive predictions/total positive predictions: 
+precision(eval_tibble_down, truth = type, estimate = class_model)
+
+# Recall tells us true positive predictions/total positives:
+recall(eval_tibble_down, truth = type, estimate = class_model)
+
+# Or the confusion matrix allows for all to be calculated: 
+conf_mat(eval_tibble_down, truth = type , estimate = class_model, dnn = c("Prediction", "Truth"))
+
+eval_tibble_down %>%
+  roc_curve(type, prop_model) %>%
+  autoplot()
+```
+
+Results from this down-sampled model are comparable, actually with slightly higher accuracy! One challenge I encountered with Tidymodels is being able to check my work. It's a bit tricky to see what's happening "under the hood", particularly with the processing step.
+
+One final check from the tutorial above is looking at the tokens that are most predictive: 
+
+```{r other plot}
+test_model$fit %>% 
+  tidy() %>%
+  mutate(term = str_replace(term, "tf_text_", "")) %>%
+  group_by(estimate > 0) %>%
+  top_n(10, abs(estimate)) %>%
+  ungroup() %>%
+  ggplot(aes(fct_reorder(term, estimate), estimate, fill = estimate > 0)) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  coord_flip() +
+  theme_minimal() +
+  labs(x = NULL,
+  title = "Coefficients that increase/decrease probability the most")
+``` 
